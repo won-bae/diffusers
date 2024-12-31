@@ -239,7 +239,27 @@ class OutConv1DBlock(nn.Module):
         hidden_states = self.final_conv1d_2(hidden_states)
         return hidden_states
 
+class OutConv1DBlockGMM(nn.Module):
+    def __init__(self, num_groups_out: int, out_channels: int, embed_dim: int, num_mixtures: int, act_fn: str):
+        super().__init__()
+        self.final_conv1d_1 = nn.Conv1d(embed_dim, embed_dim, 5, padding=2)
+        self.final_conv1d_gn = nn.GroupNorm(num_groups_out, embed_dim)
+        self.final_conv1d_act = get_activation(act_fn)
+        self.final_linear_mean = nn.Linear(embed_dim, out_channels * num_mixtures)
+        self.final_linear_std = nn.Linear(embed_dim, out_channels * num_mixtures)
+        self.final_linear_weights = nn.Linear(embed_dim, num_mixtures)
 
+    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        hidden_states = self.final_conv1d_1(hidden_states)
+        hidden_states = rearrange_dims(hidden_states)
+        hidden_states = self.final_conv1d_gn(hidden_states)
+        hidden_states = rearrange_dims(hidden_states)
+        hidden_states = self.final_conv1d_act(hidden_states)
+        hidden_states = hidden_states.squeeze(-1)
+        means = self.final_linear_mean(hidden_states)
+        log_vars = self.final_linear_std(hidden_states)
+        weight_logits = self.final_linear_weights(hidden_states)
+        return means, log_vars, weight_logits
 class OutValueFunctionBlock(nn.Module):
     def __init__(self, fc_dim: int, embed_dim: int, act_fn: str = "mish"):
         super().__init__()
@@ -392,7 +412,7 @@ class ResConvBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = self.conv_skip(hidden_states) if self.has_conv_skip else hidden_states
-
+            
         hidden_states = self.conv_1(hidden_states)
         hidden_states = self.group_norm_1(hidden_states)
         hidden_states = self.gelu_1(hidden_states)
@@ -436,12 +456,12 @@ class UNetMidBlock1D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
     def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
-        hidden_states = self.down(hidden_states)
+        # hidden_states = self.down(hidden_states)
         for attn, resnet in zip(self.attentions, self.resnets):
             hidden_states = resnet(hidden_states)
             hidden_states = attn(hidden_states)
 
-        hidden_states = self.up(hidden_states)
+        # hidden_states = self.up(hidden_states)
 
         return hidden_states
 
@@ -467,7 +487,7 @@ class AttnDownBlock1D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
     def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
-        hidden_states = self.down(hidden_states)
+        # hidden_states = self.down(hidden_states)
 
         for resnet, attn in zip(self.resnets, self.attentions):
             hidden_states = resnet(hidden_states)
@@ -491,7 +511,7 @@ class DownBlock1D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
     def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
-        hidden_states = self.down(hidden_states)
+        # hidden_states = self.down(hidden_states)
 
         for resnet in self.resnets:
             hidden_states = resnet(hidden_states)
@@ -553,7 +573,7 @@ class AttnUpBlock1D(nn.Module):
             hidden_states = resnet(hidden_states)
             hidden_states = attn(hidden_states)
 
-        hidden_states = self.up(hidden_states)
+        # hidden_states = self.up(hidden_states)
 
         return hidden_states
 
@@ -584,7 +604,7 @@ class UpBlock1D(nn.Module):
         for resnet in self.resnets:
             hidden_states = resnet(hidden_states)
 
-        hidden_states = self.up(hidden_states)
+        # hidden_states = self.up(hidden_states)
 
         return hidden_states
 
@@ -699,4 +719,6 @@ def get_out_block(
         return OutConv1DBlock(num_groups_out, out_channels, embed_dim, act_fn)
     elif out_block_type == "ValueFunction":
         return OutValueFunctionBlock(fc_dim, embed_dim, act_fn)
+    if out_block_type == "OutConv1DBlockGMM":
+        return OutConv1DBlockGMM(num_groups_out, out_channels, embed_dim, act_fn)
     return None

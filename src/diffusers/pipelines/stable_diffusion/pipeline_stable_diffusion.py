@@ -13,6 +13,9 @@
 # limitations under the License.
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
+import numpy as np
+import torch.nn as nn
+
 
 import torch
 from packaging import version
@@ -148,6 +151,145 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
+def compute_norm(x1, x2, device, batch_size=512):
+    torch_dtype = x1.dtype
+    x1_batch = x1.shape[0]
+    x2_batch = x2.shape[0]
+    x1 = x1.reshape(x1_batch, -1).float()
+    x2 = x2.reshape(x2_batch, -1).float()
+    
+    x1, x2 = x1.unsqueeze(0).to(device), x2.unsqueeze(0).to(device) # 1 x n x d, 1 x n' x d
+    dist_matrix = []
+    batch_round = x2.shape[1] // batch_size + int(x2.shape[1] % batch_size > 0)
+    for i in range(batch_round):
+        # distance comparisons are done in batches to reduce memory consumption
+        x2_subset = x2[:, i * batch_size: (i + 1) * batch_size]
+        dist = torch.cdist(x1, x2_subset, p=2.0)
+
+        dist_matrix.append(dist.cpu())
+
+    dist_matrix = torch.cat(dist_matrix, dim=-1).squeeze(0)
+    n, m = dist_matrix.shape
+    if n == m:
+        dist_matrix[torch.arange(n), torch.arange(m)] = 0.0
+    return dist_matrix.type(torch_dtype)
+
+class RBFKernel(object):
+    def __init__(self, device):
+        self.device = device
+
+    def compute_kernel(self, x1, x2, h=1.0, batch_size=512):
+        norm = compute_norm(x1, x2, self.device, batch_size=batch_size)
+        k = torch.exp(-1.0 * (norm / h) ** 2)
+        return k
+
+class TopHatKernel(object):
+    def __init__(self, device):
+        self.device = device
+
+    def compute_kernel(self, x1, x2, h, batch_size=512):
+        norm = compute_norm(x1, x2, self.device, batch_size=batch_size)
+        k = (norm < h).float()
+        return k
+    
+def construct_kernel_fn(kernel_name, device):
+    if kernel_name == "rbf":
+        kernel = RBFKernel(device)
+    elif kernel_name == "tophat":
+        kernel = TopHatKernel(device)
+    else:
+        raise NotImplementedError(f"{kernel_name} not implemented")
+    print(f'Constructed kernel: {kernel_name}')
+    return kernel
+
+class GreedyKMedoidsFilter:
+    def __init__(self, kernel="rbf", device="cuda", batch_size=1024):
+        self.kernel_fn = construct_kernel_fn(kernel, device)
+        self.batch_size = batch_size
+        self.device = device
+
+    def select_samples(self, cand_features, sel_features, budget_size, delta=1.0):
+        init_cand_size = cand_features.shape[0]
+        init_sel_size = sel_features.shape[0]
+        
+        if init_sel_size > 0:
+            rel_features = torch.cat([sel_features, cand_features], dim=0)
+        else:
+            rel_features = cand_features
+        rel_features_norm = rel_features.reshape(rel_features.shape[0], -1) / torch.norm(rel_features.reshape(rel_features.shape[0], -1), dim=-1, keepdim=True)
+        
+        kernel_all = self.kernel_fn.compute_kernel(
+            rel_features_norm, rel_features_norm,
+            delta, batch_size=self.batch_size).to(self.device) # N x N where N = s+c
+        # print(f"Memory size of kernel: {kernel_all.element_size() * kernel_all.nelement()}")
+        
+        if sel_features.shape[0] > 0:
+            kernel_la = self.kernel_fn.compute_kernel(
+                rel_features_norm[:init_sel_size], rel_features_norm,
+                delta, batch_size=self.batch_size).to(self.device)
+
+        torch.cuda.empty_cache()
+        
+        inner_sel_set = torch.arange(init_sel_size).to(self.device)
+        fixed_inner_cand_set = torch.arange(init_sel_size + init_cand_size)[init_sel_size:].to(self.device)
+        inner_cand_set_bool = torch.ones_like(fixed_inner_cand_set).bool().to(self.device)
+        inner_cand_set = fixed_inner_cand_set[inner_cand_set_bool].to(self.device)
+
+        if init_sel_size > 0:
+            max_embedding = kernel_la.max(dim=0, keepdim=True).values # 1 x N
+        else:
+            max_embedding = torch.zeros(1, init_sel_size + init_cand_size).to(self.device) # 1 x N
+
+        selected = []
+        for i in range(budget_size):
+            sel_size = len(inner_sel_set)
+            cand_size = len(inner_cand_set)
+            
+            updated_max_embedding = (kernel_all - max_embedding) # N x N
+            updated_max_embedding[updated_max_embedding < 0] = 0.
+
+            mean_max_embedding = (updated_max_embedding).mean(dim=-1) # N
+
+            # select a point from u
+            mean_max_embedding[inner_sel_set] = -np.inf
+            selected_index = torch.argmax(mean_max_embedding)
+
+            # update lSet and uSet
+            inner_sel_set = torch.cat((inner_sel_set, selected_index.view(-1)))
+            inner_cand_set_bool[selected_index - init_sel_size] = False
+            inner_cand_set = fixed_inner_cand_set[inner_cand_set_bool]
+
+            max_embedding = updated_max_embedding[selected_index].unsqueeze(0) + max_embedding
+
+            if len(set(inner_sel_set.cpu().numpy())) != sel_size + 1:
+                print(f'inner_sel_set: {len(set(inner_sel_set.cpu().numpy()))} is not equal to {sel_size+1}')
+                import IPython; IPython.embed(); exit()
+            if len(set(inner_cand_set.cpu().numpy())) != cand_size - 1:
+                print(f'inner_cand_set: {len(set(inner_cand_set.cpu().numpy()))} is not equal to {cand_size-1}')
+                import IPython; IPython.embed(); exit()
+            if len(np.intersect1d(inner_sel_set.cpu().numpy(), inner_cand_set.cpu().numpy())) != 0:
+                print(f'inner_sel_set and inner_cand_set overlaps: {np.intersect1d(inner_sel_set.cpu().numpy(), inner_cand_set.cpu().numpy())}')
+                import IPython; IPython.embed(); exit()
+
+        selected = inner_sel_set[init_sel_size:].cpu()
+        assert len(selected) == budget_size, 'added a different number of samples'
+        
+        selected_cand_indices = torch.arange(init_cand_size)[torch.logical_not(inner_cand_set_bool).cpu()]        
+        return selected_cand_indices
+    
+
+def compute_weights(pred_x_0, x_t, t, noise_scheduler, num_samples=30):
+    batch_size = pred_x_0.shape[0]
+    pred_x_0_expanded = pred_x_0.unsqueeze(0)  # Shape becomes (1, *pred_x_0.shape)
+    pred_x_0_repeated = pred_x_0_expanded.expand(num_samples, *pred_x_0.shape)  # Shape becomes (num_samples, *pred_x_0.shape)
+    
+    noises = torch.randn_like(pred_x_0_repeated)
+    ts = (torch.ones(num_samples).to(pred_x_0.device) * t).int()
+    
+    batch_x_s = noise_scheduler.add_noise(pred_x_0_repeated, noises, ts)
+    weights = torch.norm(x_t.unsqueeze(0).reshape(1, batch_size, -1) - batch_x_s.reshape(num_samples, batch_size, -1), dim=2).mean(dim=0) # (batch_size,)
+    
+    return weights    
 
 class StableDiffusionPipeline(
     DiffusionPipeline,
@@ -794,6 +936,11 @@ class StableDiffusionPipeline(
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        filter_t_threshold: int = 400,
+        delta: float=1.0,
+        m_max: int=100,
+        m_min: int=10,
+        mutation_eta: float=0.5,
         **kwargs,
     ):
         r"""
@@ -1005,6 +1152,10 @@ class StableDiffusionPipeline(
             ).to(device=device, dtype=latents.dtype)
 
         # 7. Denoising loop
+        start_filter = False
+        filter = GreedyKMedoidsFilter(kernel='rbf')
+        pool = nn.AvgPool2d(kernel_size=8, stride=8)
+        
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1037,7 +1188,100 @@ class StableDiffusionPipeline(
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                next_latents = latents
+                output_tuple = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)
+                latents = output_tuple[0]
+                latents_0 = output_tuple[1]
+                
+                # filter
+                if t < filter_t_threshold:
+                    # 3. mutation
+                    variance = output_tuple[-1]
+                    std_dev_t = mutation_eta * variance ** (0.5) 
+                    
+                    print(f'std: {std_dev_t}')
+                    
+                    if not start_filter:
+                        start_filter = True
+                        delta = 'max' # std_dev_t.cpu() / mutation_eta
+                    else:
+                        delta = 'max'
+                    
+                    # if i > 0:
+                    #     weights = compute_weights(latents_0, next_latents, timesteps[i-1], self.scheduler, num_samples=50) # (batch_size,)
+                    #     weights = (weights - weights.min()) / (weights.max() - weights.min())
+                    #     if torch.any(torch.isnan(weights)):
+                    #         num_mutations = (torch.ones(latents_0.shape[0]) * m_max).int().to(device)
+                    #     else:
+                    #         num_mutations = ((1.0 - weights) * (m_max - m_min) + m_min).int()
+                    #     print(f'num_mutations: {num_mutations}')
+                        
+                    #     mutated_samples = []
+                    #     for b, num_mutation in enumerate(num_mutations):
+                    #         variance_noise = torch.randn((num_mutation, *latents.shape[1:]), generator=generator, device=device, dtype=self.dtype)
+                    #         mutated_sample = (latents[b].unsqueeze(0) + std_dev_t * variance_noise).reshape(-1, *latents.shape[1:])
+                    #         mutated_samples.append(mutated_sample)
+                    #     mutated_samples = torch.cat(mutated_samples, dim=0)
+                    # else:
+                    variance_noise = torch.randn((latents.shape[0], m_max, *latents.shape[1:]), generator=generator, device=device, dtype=self.dtype)
+                    try:
+                        mutated_samples = (latents.unsqueeze(1) + std_dev_t * variance_noise).reshape(-1, *latents.shape[1:])
+                    except:
+                        import IPython; IPython.embed()
+                    # TODO: compute weights for each mutated samples
+                    
+                    # compute delta
+                    latents_pooled = pool(latents)
+                    print(f'latent pooled shape: {latents_pooled.shape}')
+                    latents_pooled = latents_pooled.reshape(latents_pooled.shape[0], -1) / torch.norm(latents_pooled.reshape(latents_pooled.shape[0], -1), dim=-1, keepdim=True)
+                    
+                    dist_ll = compute_norm(latents_pooled, latents_pooled, device)
+                    if delta == 'min':
+                        delta = dist_ll[dist_ll > 0.].min() 
+                    elif delta == 'median':
+                        delta = dist_ll[dist_ll > 0.].median()
+                    elif delta == 'max':
+                        delta = dist_ll[dist_ll > 0.].max()
+                    
+                    # delta = torch.max(delta, torch.tensor([1.0]))
+                    # delta = std_dev_t.cpu() / mutation_eta
+                    delta = delta * 3.0
+                    print(f'delta: {delta}')
+                    
+                    # latents_pooled = pool(latents)
+                    # mutated_samples_pooled = pool(mutated_samples)
+                    
+                    # dist_al = compute_norm(mutated_samples_pooled, latents_pooled, device) # N x C
+                    # delta = dist_al[dist_al > 0].median()
+                    # similarities = torch.exp(-(dist_al / delta) ** 2)
+                    
+                    # soft_memberships = similarities / similarities.sum(dim=1, keepdim=True)  # Shape: [N, C]
+                    # entropy = -torch.sum(soft_memberships * torch.log(soft_memberships + 1e-10), dim=1)  # Shape: [N]
+                    # assigned_centroids = torch.argmax(soft_memberships, dim=1)  # Shape: [N]
+
+                    # # For each centroid, find the sample with the highest entropy
+                    # highest_entropy_indices = []
+                    # for k in range(latents_pooled.shape[0]):
+                    #     membership_bool = assigned_centroids == k
+                    #     membership_indices = torch.where(membership_bool)[0]
+                    #     print(f'class {k}: num = {membership_indices.shape[0]}')
+                        
+                    #     max_idx = torch.argmax(entropy[membership_bool])
+                    #     try:
+                    #         highest_entropy_indices.append(membership_indices[max_idx])
+                    #     except:
+                    #         import IPython; IPython.embed()
+                    
+                    # selected_cand_indices = torch.stack(highest_entropy_indices)
+                    # print(f'selected cand indices: {selected_cand_indices}')
+                    
+                    # 4. survival
+                    mutated_samples_pooled = pool(mutated_samples)
+                    budget_size = latents.shape[0]
+                    selected_cand_indices = filter.select_samples(
+                        mutated_samples_pooled.squeeze(-1), torch.tensor([]), budget_size, delta=delta)                
+                    latents = mutated_samples[selected_cand_indices] 
+
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

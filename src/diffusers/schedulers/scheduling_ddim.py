@@ -45,6 +45,7 @@ class DDIMSchedulerOutput(BaseOutput):
 
     prev_sample: torch.Tensor
     pred_original_sample: Optional[torch.Tensor] = None
+    variance: Optional[torch.Tensor] = None
 
 
 # Copied from diffusers.schedulers.scheduling_ddpm.betas_for_alpha_bar
@@ -466,9 +467,10 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
             return (
                 prev_sample,
                 pred_original_sample,
+                variance,
             )
 
-        return DDIMSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
+        return DDIMSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample, variance=variance)
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.add_noise
     def add_noise(

@@ -596,6 +596,8 @@ class UNet2DConditionModel(
                 image_embed_dim=encoder_hid_dim,
                 cross_attention_dim=cross_attention_dim,
             )
+        elif encoder_hid_dim_type == "audio_proj":
+            self.encoder_hid_proj = nn.Linear(encoder_hid_dim, cross_attention_dim)
         elif encoder_hid_dim_type is not None:
             raise ValueError(
                 f"`encoder_hid_dim_type`: {encoder_hid_dim_type} must be None, 'text_proj', 'text_image_proj', or 'image_proj'."
@@ -1035,6 +1037,9 @@ class UNet2DConditionModel(
             image_embeds = added_cond_kwargs.get("image_embeds")
             image_embeds = self.encoder_hid_proj(image_embeds)
             encoder_hidden_states = (encoder_hidden_states, image_embeds)
+        elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "audio_proj":
+            encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
+            
         return encoder_hidden_states
 
     def forward(

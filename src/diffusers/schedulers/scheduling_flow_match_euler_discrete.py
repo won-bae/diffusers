@@ -80,7 +80,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution
             sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
 
-        self.timesteps = sigmas * num_train_timesteps
+        self.timesteps = torch.round(sigmas * num_train_timesteps, decimals=0).float()
 
         self._step_index = None
         self._begin_index = None
@@ -88,7 +88,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         self.sigmas = sigmas.to("cpu")  # to avoid too much CPU/GPU communication
         self.sigma_min = self.sigmas[-1].item()
         self.sigma_max = self.sigmas[0].item()
-
+        
     @property
     def step_index(self):
         """
@@ -190,19 +190,18 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         if sigmas is None:
             self.num_inference_steps = num_inference_steps
-            timesteps = np.linspace(
+            timesteps = np.round(np.linspace(
                 self._sigma_to_t(self.sigma_max), self._sigma_to_t(self.sigma_min), num_inference_steps
-            )
-
+            ), decimals=0)
             sigmas = timesteps / self.config.num_train_timesteps
-
+            
         if self.config.use_dynamic_shifting:
             sigmas = self.time_shift(mu, 1.0, sigmas)
         else:
             sigmas = self.config.shift * sigmas / (1 + (self.config.shift - 1) * sigmas)
 
         sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32, device=device)
-        timesteps = sigmas * self.config.num_train_timesteps
+        timesteps = torch.round(sigmas * self.config.num_train_timesteps, decimals=0).float() 
 
         self.timesteps = timesteps.to(device=device)
         self.sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
@@ -221,7 +220,11 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         # This way we can ensure we don't accidentally skip a sigma in
         # case we start in the middle of the denoising schedule (e.g. for image-to-image)
         pos = 1 if len(indices) > 1 else 0
-
+        try:
+            indices[pos].item() 
+        except:
+            print(f'timestep: {timestep}\n')
+            import IPython; IPython.embed()
         return indices[pos].item()
 
     def _init_step_index(self, timestep):
@@ -288,12 +291,13 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         if self.step_index is None:
             self._init_step_index(timestep)
 
+        # print(f'timestep: {timestep}, step index: {self.step_index}')
         # Upcast to avoid precision issues when computing prev_sample
         sample = sample.to(torch.float32)
 
         sigma = self.sigmas[self.step_index]
         sigma_next = self.sigmas[self.step_index + 1]
-
+        
         prev_sample = sample + (sigma_next - sigma) * model_output
 
         # Cast sample back to model compatible dtype
